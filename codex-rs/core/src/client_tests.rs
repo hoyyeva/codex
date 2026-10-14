@@ -491,6 +491,61 @@ fn output_with_tool_result_metadata(metadata: ToolResultMetadata) -> ResponseIte
     output
 }
 
+#[test]
+fn ollama_history_is_portable_only_on_return_to_openai() -> anyhow::Result<()> {
+    let history: Vec<ResponseItem> = serde_json::from_value(json!([
+        {"type": "reasoning", "id": "rs_43372", "summary": [{"type": "summary_text", "text": "thinking"}], "encrypted_content": "thinking"},
+        {"type": "compaction", "encrypted_content": json!({"type": "ollama_compaction", "version": 1, "summary": "Remember kiwi-42", "retained": []}).to_string()},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Continue"}]}
+    ]))?;
+    let portable: Vec<ResponseItem> = serde_json::from_value(json!([
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Remember kiwi-42"}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Continue"}]}
+    ]))?;
+    let prompt = Prompt {
+        input: history.clone(),
+        base_instructions: BaseInstructions {
+            text: String::new(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for (base_url, expected) in [
+        (None, &portable),
+        (Some("https://api.openai.com/v1"), &portable),
+        (Some("https://chatgpt.com/backend-api/codex"), &portable),
+        (Some("http://127.0.0.1:11434/v1"), &history),
+        (Some("https://ollama.com/v1"), &history),
+    ] {
+        let mut client = test_model_client(SessionSource::Cli);
+        Arc::get_mut(&mut client.state).unwrap().provider = create_model_provider(
+            ModelProviderInfo::create_openai_provider(base_url.map(str::to_owned)),
+            /*auth_manager*/ None,
+        );
+        let metadata = test_responses_metadata_for_client(
+            &client,
+            /*turn_id*/ None,
+            format!("{}:0", client.state.thread_id),
+            /*parent_thread_id*/ None,
+            TestCodexResponsesRequestKind::Turn,
+        );
+        let request = client.build_responses_request(
+            &prompt,
+            &test_model_info(),
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &metadata,
+            /*include_internal*/ false,
+        )?;
+        assert_eq!(&request.input, expected);
+        let websocket = serde_json::to_value(codex_api::ResponseCreateWsRequest::from(&request))?;
+        assert_eq!(websocket["input"], serde_json::to_value(expected)?);
+        assert_eq!(prompt.input, history);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn responses_request_includes_internal_metadata_for_provider_grant_or_first_party_destination()
 -> anyhow::Result<()> {

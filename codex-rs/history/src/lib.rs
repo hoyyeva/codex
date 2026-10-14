@@ -1,5 +1,8 @@
 //! Model-history and persisted-rollout domain types.
 
+mod ollama;
+pub use ollama::normalize_ollama_history;
+
 mod heartbeat;
 pub use heartbeat::HEARTBEAT_CONTENT_KIND;
 pub use heartbeat::Heartbeat;
