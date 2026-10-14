@@ -964,6 +964,20 @@ impl ModelClient {
         include_internal: bool,
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info);
+        let provider = self.state.provider.info();
+        if provider.is_openai()
+            && provider.base_url.as_deref().is_none_or(|base_url| {
+                url::Url::parse(base_url).ok().is_some_and(|url| {
+                    url.scheme() == "https"
+                        && url.host_str().is_some_and(|host| {
+                            host == "api.openai.com"
+                                || codex_http_client::is_allowed_chatgpt_host(host)
+                        })
+                })
+            })
+        {
+            input = codex_history::normalize_ollama_history(input)?;
+        }
         if !self.reasoning_effort_override_enabled(model_info) {
             // Unsupported models and disabled overrides must also accept saved history.
             // Filter only the request copy; persisted history remains unchanged.
