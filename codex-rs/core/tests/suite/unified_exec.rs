@@ -45,6 +45,7 @@ use core_test_support::process::wait_for_process_exit;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -756,6 +757,94 @@ async fn unified_exec_intercepts_apply_patch_exec_command() -> Result<()> {
         "hello from unified exec\n"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_exec_redundant_escalation_in_full_access() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_target_windows!(Ok(()), "uses a POSIX marker command");
+
+    for namespace in [None, Some("functions")] {
+        for permission_profile in [
+            PermissionProfile::Disabled,
+            PermissionProfile::read_only(),
+            PermissionProfile::workspace_write(),
+            PermissionProfile::External {
+                network: NetworkSandboxPolicy::Enabled,
+            },
+            PermissionProfile::Managed {
+                file_system: codex_protocol::models::ManagedFileSystemPermissions::Unrestricted,
+                network: NetworkSandboxPolicy::Restricted,
+            },
+        ] {
+            let full_access = permission_profile == PermissionProfile::Disabled;
+            let server = start_mock_server().await;
+            let mut builder = test_codex().with_model("gpt-5.2");
+            let test = builder.build_with_auto_env(&server).await?;
+            let call_id = "redundant-full-access-escalation";
+            let arguments = json!({
+                "cmd": "printf FULL_ACCESS_OK",
+                "login": false,
+                "sandbox_permissions": "require_escalated",
+                "justification": "Print the test marker",
+                "prefix_rule": ["printf"],
+            })
+            .to_string();
+            let call = match namespace {
+                Some(namespace) => {
+                    ev_function_call_with_namespace(call_id, namespace, "exec_command", &arguments)
+                }
+                None => ev_function_call(call_id, "exec_command", &arguments),
+            };
+            let mock = mount_sse_sequence(
+                &server,
+                vec![
+                    sse(vec![
+                        ev_response_created("resp-1"),
+                        call,
+                        ev_completed("resp-1"),
+                    ]),
+                    sse(vec![
+                        ev_response_created("resp-2"),
+                        ev_assistant_message("msg-1", "finished"),
+                        ev_completed("resp-2"),
+                    ]),
+                ],
+            )
+            .await;
+
+            submit_unified_exec_turn(&test, "Print the marker", permission_profile).await?;
+            let mut exit_codes = Vec::new();
+            wait_for_event(&test.codex, |event| match event {
+                EventMsg::ExecApprovalRequest(_) => panic!("Never must not prompt for approval"),
+                EventMsg::ExecCommandEnd(event) if event.call_id == call_id => {
+                    exit_codes.push(event.exit_code);
+                    false
+                }
+                EventMsg::TurnComplete(_) => true,
+                _ => false,
+            })
+            .await;
+
+            let request = mock.last_request().expect("tool output request");
+            let output_item = request.function_call_output(call_id);
+            let output = extract_output_text(&output_item).expect("tool output text");
+            if full_access {
+                assert_eq!(exit_codes, vec![0]);
+                let parsed = parse_unified_exec_output(output)?;
+                assert_eq!(parsed.exit_code, Some(0));
+                assert_eq!(parsed.output.trim(), "FULL_ACCESS_OK");
+            } else {
+                assert_eq!(exit_codes, Vec::<i32>::new());
+                assert!(
+                    output.contains("approval policy is Never; reject command"),
+                    "{output}"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

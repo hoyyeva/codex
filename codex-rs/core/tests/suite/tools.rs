@@ -14,6 +14,7 @@ use codex_features::Feature;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
+use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ConfigShellToolType;
@@ -24,6 +25,7 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::assert_regex_match;
@@ -32,6 +34,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_custom_tool_call_with_namespace;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_once;
 use core_test_support::responses::mount_sse_once;
@@ -68,6 +71,108 @@ fn tool_names(body: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_exec_command_keeps_escalation_arguments_in_full_access() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::Disabled)
+            .expect("set full access");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "sandbox_permissions": {"type": "string"},
+            "justification": {"type": "string"},
+            "prefix_rule": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["sandbox_permissions", "justification", "prefix_rule"],
+        "additionalProperties": false,
+    });
+    let thread = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+                name: "application".to_string(),
+                description: "Application-specific functions".to_string(),
+                tools: vec![DynamicToolNamespaceTool::Function(
+                    DynamicToolFunctionSpec {
+                        name: "exec_command".to_string(),
+                        description: "A user-defined function, unrelated to shell execution"
+                            .to_string(),
+                        input_schema: schema.clone(),
+                        defer_loading: false,
+                    },
+                )],
+            })],
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?
+        .thread;
+    let arguments = json!({
+        "sandbox_permissions": "require_escalated",
+        "justification": "Application-specific meaning",
+        "prefix_rule": ["application"],
+    });
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call_with_namespace(
+                    "custom-exec",
+                    "application",
+                    "exec_command",
+                    &arguments.to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+    thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Call the application function".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let EventMsg::DynamicToolCallRequest(request) = wait_for_event(&thread, |event| {
+        matches!(event, EventMsg::DynamicToolCallRequest(_))
+    })
+    .await
+    else {
+        unreachable!("expected dynamic tool request");
+    };
+    assert_eq!(request.namespace.as_deref(), Some("application"));
+    assert_eq!(request.tool, "exec_command");
+    assert_eq!(request.arguments, arguments);
+    thread
+        .submit(Op::DynamicToolResponse {
+            id: request.call_id,
+            response: DynamicToolResponse {
+                content_items: Vec::new(),
+                success: true,
+            },
+        })
+        .await?;
+    wait_for_event(&thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert_eq!(
+        mock.requests()[0]
+            .tool_by_name("application", "exec_command")
+            .expect("custom tool")["parameters"],
+        schema,
+    );
+    Ok(())
 }
 
 #[test_case(false, false; "normal sampling")]

@@ -601,8 +601,10 @@ async fn powershell_independent_literal_commands_preserve_url_launch_checks() ->
     Ok(())
 }
 
+#[test_case::test_case(false; "ordinary command")]
+#[test_case::test_case(true; "redundant full access escalation")]
 #[tokio::test]
-async fn execpolicy_blocks_shell_invocation() -> Result<()> {
+async fn execpolicy_blocks_shell_invocation(escalated: bool) -> Result<()> {
     let mut builder = test_codex().with_config(|config| {
         let policy_path = config.codex_home.join("rules").join("policy.rules");
         fs::create_dir_all(
@@ -621,10 +623,13 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
     let test = builder.build(&server).await?;
 
     let call_id = "shell-forbidden";
-    let args = json!({
+    let mut args = json!({
         "cmd": "echo blocked",
         "yield_time_ms": 1_000,
     });
+    if escalated {
+        args["sandbox_permissions"] = json!("require_escalated");
+    }
 
     mount_sse_once(
         &server,

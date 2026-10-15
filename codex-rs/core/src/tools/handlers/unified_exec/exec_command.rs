@@ -34,6 +34,9 @@ use crate::unified_exec::generate_chunk_id;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::SandboxPermissions;
+use codex_protocol::protocol::AskForApproval;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
@@ -237,8 +240,20 @@ impl ExecCommandHandler {
                 "TTY execution is disabled by config; omit `tty` or set it to false.".to_string(),
             ));
         }
-        let sandbox_permissions =
+        let approval_policy = context.step_context.settings.approval_policy();
+        let mut sandbox_permissions =
             resolve_sandbox_permissions(args.sandbox_permissions, args.justification.as_deref())?;
+        // Full Access already runs without a sandbox. A redundant escalation must
+        // still use the ordinary execution path, including command policy checks.
+        if sandbox_permissions == SandboxPermissions::RequireEscalated
+            && approval_policy == AskForApproval::Never
+            && matches!(
+                turn_environment.permission_profile(),
+                PermissionProfile::Disabled
+            )
+        {
+            sandbox_permissions = SandboxPermissions::UseDefault;
+        }
         let hook_command = args.cmd.clone();
         maybe_emit_implicit_skill_invocation(
             session.as_ref(),
@@ -319,7 +334,6 @@ impl ExecCommandHandler {
 
         // Sticky turn permissions have already been approved, so they should
         // continue through the normal exec approval flow for the command.
-        let approval_policy = context.step_context.settings.approval_policy();
         if effective_additional_permissions
             .sandbox_permissions
             .requests_sandbox_override()
